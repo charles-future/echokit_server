@@ -1,0 +1,30 @@
+addr = "0.0.0.0:8080"
+hello_wav = "hello.wav"
+
+[tts]
+platform = "openai"
+url = "https://api.groq.com/openai/v1/audio/speech"
+model = "canopylabs/orpheus-v1-english"
+api_key = "gsk_ABCD"
+voice = "austin"
+
+[asr]
+platform = "openai"
+url = "https://api.groq.com/openai/v1/audio/transcriptions"
+api_key = "gsk_ABCD"
+model = "whisper-large-v3"
+lang = "en"
+prompt = "Hello\n你好\n(noise)\n(bgm)\n(silence)\n"
+
+[llm]
+platform = "openai_chat"
+url = "https://api.groq.com/openai/v1/chat/completions"
+api_key = "gsk_ABCD"
+model = "openai/gpt-oss-20b"
+history = 5
+
+[[llm.sys_prompts]]
+role = "system"
+content = """
+You are a helpful assistant. Answer truthfully and concisely.
+"""

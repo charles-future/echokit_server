@@ -1,0 +1,51 @@
+addr = "0.0.0.0:8080"
+hello_wav = "hello.wav"
+
+# Get your API key from https://bailian.console.aliyun.com/
+
+[asr]
+platform = "paraformer_v2"
+url = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
+paraformer_token = "sk-API-KEY"
+
+
+[tts]
+platform = "cosyvoice"
+url = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
+token = "sk-API-KEY"
+speaker = "longhua_v2"
+
+# Supported platforms: cosyvoice-v2 (default) and cosyvoice-v1
+# Get speaker list from https://help.aliyun.com/zh/model-studio/cosyvoice-java-sdk#722dd7ca66a6x
+
+[llm]
+platform = "openai_chat"
+url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+api_key = "sk-API-KEY"
+model = "qwen-plus"
+history = 5
+
+[llm.extra]
+enable_search = true
+
+[[llm.sys_prompts]]
+role = "system"
+content = """
+You are a helpful assistant. Answer truthfully and concisely.
+
+- NEVER use bullet points
+- NEVER use tables
+- Answer in complete sentences as if you are in a conversation.
+- Use the web_search tool if you need information about current events such as news, political figures, stock prices, and crypto prices.
+
+------
+
+您是一位乐于助人的助手。请如实简洁地回答问题。
+
+- 切勿使用列表
+- 切勿使用表格
+- 请使用完整的句子回答，就像在对话一样。
+- 如果您需要了解时事信息，例如新闻、政治人物、股票价格和加密货币价格，请使用 web_search tool。
+
+"""
+

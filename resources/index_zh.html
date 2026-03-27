@@ -1,0 +1,838 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dim">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>音频聊天</title>
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@5" rel="stylesheet" type="text/css" />
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@5/themes.css" rel="stylesheet" type="text/css" />
+    <!-- 添加 MessagePack 依赖 -->
+    <script crossorigin src="https://unpkg.com/@msgpack/msgpack"></script>
+    <!-- 添加 VAD-Web 依赖 -->
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.14.0/dist/ort.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.22/dist/bundle.min.js"></script>
+
+    <script src="https://openfpcdn.io/fingerprintjs/v5/iife.min.js"></script>
+    <style>
+        .recording-pulse {
+            animation: pulse 1s ease-in-out infinite alternate;
+        }
+
+        @keyframes pulse {
+            from {
+                transform: scale(1);
+            }
+
+            to {
+                transform: scale(1.05);
+            }
+        }
+
+        .message-debug {
+            font-family: monospace;
+            font-size: 0.8em;
+            color: #888;
+            margin-top: 4px;
+            padding: 4px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 4px;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="card shadow-xl">
+        <div class="card-body">
+            <h1 class="card-title text-2xl justify-center mb-6">语音聊天</h1>
+
+            <!-- WebSocket 连接区域 -->
+            <div class="flex gap-2 mb-6">
+                <input type="text" id="wsUrl" placeholder="WebSocket 地址 (例如, ws://localhost:8080/ws/)"
+                    value="wss://indie.echokit.dev/ws/" class="input input-bordered flex-1" />
+                <button id="connectBtn" class="btn btn-primary">连接</button>
+            </div>
+
+            <!-- 连接状态显示 -->
+            <div id="connectionStatus" class="alert alert-info mb-4 hidden">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                        d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                </svg>
+                <span id="connectionStatusText">未连接</span>
+            </div>
+
+            <!-- 控制选项 -->
+            <div class="mb-4 space-y-2">
+                <div class="form-control">
+                    <label class="label cursor-pointer">
+                        <span class="label-text">显示调试信息</span>
+                        <input type="checkbox" id="debugMode" class="checkbox" />
+                    </label>
+                </div>
+                <div class="form-control">
+                    <label class="label cursor-pointer">
+                        <span class="label-text">录制模式</span>
+                        <input type="checkbox" id="recordingMode" class="checkbox" />
+                    </label>
+                </div>
+            </div>
+
+            <!-- 聊天显示区域 -->
+            <div class="divider">消息</div>
+            <div id="chatContainer" class="bg-base-200 rounded-lg p-4 h-96 overflow-y-auto">
+                <div class="space-y-4" id="chatMessages">
+                    <!-- 示例消息 -->
+                    <div class="chat chat-start">
+                        <div class="chat-bubble">欢迎使用语音聊天功能！</div>
+                    </div>
+
+                </div>
+            </div>
+
+            <!-- 录制控制区域 -->
+            <div class="flex justify-end items-center gap-4 mt-4">
+                <div id="recordingStatus" class="text-sm text-base-content/70 hidden">
+                    <span class="loading loading-dots loading-sm"></span>
+                    正在录制...
+                </div>
+
+                <button id="recordBtn" class="btn btn-primary btn-lg">
+                    <svg id="micIcon" class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                            d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z">
+                        </path>
+                    </svg>
+                    <span id="recordText">开始录制</span>
+                    <kbd class="kbd kbd-sm ml-2 bg-white text-black">空格</kbd>
+                </button>
+            </div>
+
+            <!-- 操作按钮 -->
+            <div class="card-actions justify-center mt-4">
+                <button id="clearChat" class="btn btn-outline btn-error btn-sm">
+                    清除聊天
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        FingerprintJS.load().then(fp => fp.get()).then(result => {
+            window.visitorId = result.visitorId;
+            console.log("FingerprintJS Visitor ID:", window.visitorId);
+        });
+
+        class AudioRecorder {
+            constructor() {
+                this.isRecording = false;
+                this.audioContext = null;
+                this.mediaStreamSource = null;
+                this.scriptProcessor = null;
+                this.stream = null;
+                this.pcmData = [];
+                this.websocket = null;
+                this.isConnected = false;
+                this.debugMode = false;
+                this.recordingMode = false; // 录制模式状态
+
+                // 音频缓存相关
+                this.isReceivingAudio = false;
+                this.audioChunks = [];
+
+                // 音频播放队列
+                this.audioQueue = [];
+                this.currentAudio = null;
+                this.isPlaying = false;
+
+                // VAD 相关
+                this.myvad = null;
+                this.isVadActive = false;
+
+                this.initializeElements();
+                this.bindEvents();
+                this.initializeVAD();
+            }
+
+            initializeElements() {
+                this.recordBtn = document.getElementById('recordBtn');
+                this.recordText = document.getElementById('recordText');
+                this.micIcon = document.getElementById('micIcon');
+                this.recordingStatus = document.getElementById('recordingStatus');
+                this.chatMessages = document.getElementById('chatMessages');
+                this.chatContainer = document.getElementById('chatContainer');
+                this.clearBtn = document.getElementById('clearChat');
+                this.wsUrlInput = document.getElementById('wsUrl');
+                this.connectBtn = document.getElementById('connectBtn');
+                this.connectionStatus = document.getElementById('connectionStatus');
+                this.connectionStatusText = document.getElementById('connectionStatusText');
+                this.debugModeCheckbox = document.getElementById('debugMode');
+                this.recordingModeCheckbox = document.getElementById('recordingMode'); // 录制模式勾选框
+            }
+
+            bindEvents() {
+                this.recordBtn.addEventListener('click', () => this.toggleRecording());
+                this.clearBtn.addEventListener('click', () => this.clearChat());
+                this.connectBtn.addEventListener('click', () => this.toggleConnection());
+                this.debugModeCheckbox.addEventListener('change', (e) => {
+                    this.debugMode = e.target.checked;
+                });
+                // 新增：录制模式切换事件
+                this.recordingModeCheckbox.addEventListener('change', (e) => {
+                    this.recordingMode = e.target.checked;
+                    const modeText = this.recordingMode ? '录制模式' : '对话模式';
+                    this.addServerMessage(`🔄 切换到${modeText}`);
+
+                    // 切换模式时，如果正在监听则停止
+                    if (this.isVadActive) {
+                        this.toggleRecording();
+                    }
+                });
+
+                // 添加空格键快捷键
+                document.addEventListener('keydown', (event) => {
+                    if (event.code === 'Space' && event.target.tagName !== 'INPUT') {
+                        event.preventDefault(); // 防止页面滚动
+                        this.toggleRecording();
+                    }
+                });
+            }
+
+            async initializeVAD() {
+                try {
+                    this.addServerMessage('正在初始化 VAD...');
+
+                    this.myvad = await vad.MicVAD.new({
+                        onSpeechStart: () => {
+                            this.addUserMessage('🎤 检测到语音开始');
+                            this.recordingStatus.classList.remove('hidden');
+                            this.recordBtn.classList.add('recording-pulse');
+                        },
+                        onSpeechEnd: (audio) => {
+                            if (this.debugMode) {
+                                this.addServerMessage(`🔇 语音结束 - 采样点: ${audio.length}`);
+                            }
+                            this.recordingStatus.classList.add('hidden');
+                            this.recordBtn.classList.remove('recording-pulse');
+
+                            // 创建音频播放器并发送到服务器
+                            this.createAudioPlayer(audio, true);
+                            this.sendAudioToServer(audio);
+                        },
+                        onVADMisfire: () => {
+                            if (this.debugMode) {
+                                this.addServerMessage('⚠️ VAD 误触发');
+                            }
+                        },
+                    });
+
+                    this.addServerMessage('✅ VAD 初始化完成');
+                    this.recordText.textContent = '开始监听';
+
+                } catch (error) {
+                    this.addServerMessage(`❌ VAD 初始化失败: ${error.message}`);
+                    console.error('VAD 初始化失败:', error);
+                }
+            }
+
+            createAudioPlayer(audioData, isUser = false) {
+                const wavBlob = this.createWavFile(audioData, 16000);
+                const audioUrl = URL.createObjectURL(wavBlob);
+                this.addAudioMessage(audioUrl, isUser);
+            }
+
+            toggleConnection() {
+                if (this.isConnected) {
+                    this.disconnectWebSocket();
+                } else {
+                    // 根据录制模式状态决定是否添加 record 参数
+                    this.connectWebSocket(this.recordingMode);
+                }
+            }
+
+            connectWebSocket(addRecordParam = false) {
+                let url = this.wsUrlInput.value.trim();
+                if (!url) {
+                    this.addServerMessage('请输入 WebSocket 地址');
+                    return;
+                }
+                url = url.endsWith('/') ? url : url + '/';
+                let id = window.visitorId || crypto.randomUUID();
+                url = url + id;
+
+                // 如果需要添加录制参数
+                if (addRecordParam) {
+                    url = url + '?record=true';
+                }
+
+                try {
+                    this.websocket = new WebSocket(url);
+                    this.websocket.binaryType = 'arraybuffer'; // 设置为接收二进制数据
+
+                    this.websocket.onopen = () => {
+                        this.isConnected = true;
+                        this.updateConnectionStatus('connected', '已连接: ' + id);
+                        this.connectBtn.textContent = '断开';
+                        this.connectBtn.classList.remove('btn-primary');
+                        this.connectBtn.classList.add('btn-error');
+                        this.addServerMessage('WebSocket 连接成功');
+                    };
+
+                    this.websocket.onmessage = (event) => {
+                        this.handleWebSocketMessage(event);
+                    };
+
+                    this.websocket.onclose = () => {
+                        this.isConnected = false;
+                        this.updateConnectionStatus('disconnected', '连接已断开');
+                        this.connectBtn.textContent = '连接';
+                        this.connectBtn.classList.remove('btn-error');
+                        this.connectBtn.classList.add('btn-primary');
+                        this.addServerMessage('WebSocket 连接已断开');
+                    };
+
+                    this.websocket.onerror = (error) => {
+                        console.error('WebSocket 错误:', error);
+                        this.addServerMessage('WebSocket 连接失败');
+                    };
+
+                    this.updateConnectionStatus('connecting', '正在连接...');
+                    this.connectBtn.textContent = '连接中...';
+                    this.connectBtn.disabled = true;
+
+                    setTimeout(() => {
+                        this.connectBtn.disabled = false;
+                        if (!this.isConnected) {
+                            this.connectBtn.textContent = '连接';
+                        }
+                    }, 5000);
+
+                } catch (error) {
+                    console.error('WebSocket 连接失败:', error);
+                    this.addServerMessage('WebSocket 连接失败: ' + error.message);
+                }
+            }
+
+            handleWebSocketMessage(event) {
+                try {
+                    let messageData;
+                    let debugInfo = '';
+
+                    if (event.data instanceof ArrayBuffer) {
+                        // 处理二进制数据 (MessagePack)
+                        try {
+                            messageData = MessagePack.decode(new Uint8Array(event.data));
+                            debugInfo = `MessagePack 数据: ${JSON.stringify(messageData, null, 2)}`;
+                            this.processMessagePackData(messageData, debugInfo);
+                        } catch (msgpackError) {
+                            console.error('MessagePack 解码失败:', msgpackError);
+                            // 如果不是 MessagePack 数据，可能是原始音频数据
+                            debugInfo = `二进制数据长度: ${event.data.byteLength} 字节`;
+                            this.addServerMessage(`收到二进制数据 (${event.data.byteLength} 字节)`, debugInfo);
+                        }
+                    } else {
+                        // 处理文本数据
+                        try {
+                            messageData = JSON.parse(event.data);
+                            debugInfo = `JSON 数据: ${JSON.stringify(messageData, null, 2)}`;
+                            this.processJSONData(messageData, debugInfo);
+                        } catch (jsonError) {
+                            // 纯文本消息
+                            debugInfo = `文本消息: "${event.data}"`;
+                            this.addServerMessage(event.data, debugInfo);
+                        }
+                    }
+                } catch (error) {
+                    console.error('处理消息时出错:', error);
+                    this.addServerMessage('处理消息时出错: ' + error.message);
+                }
+            }
+
+            processMessagePackData(data, debugInfo) {
+                if (typeof data === 'string') {
+                    // 处理字符串事件
+                    switch (data) {
+                        case 'HelloStart':
+                            break;
+                        case 'HelloEnd':
+                            break;
+                        case 'BGStart':
+                            break;
+                        case 'BGEnd':
+                            break;
+                        case 'EndAudio':
+                            // 处理完整的音频数据
+                            if (this.isReceivingAudio && this.audioChunks.length > 0) {
+                                this.processCompletedAudio();
+                            }
+                            this.isReceivingAudio = false;
+                            this.audioChunks = [];
+                            // 移除音频回复结束的消息显示
+                            break;
+                        case 'StartVideo':
+                            this.addServerMessage(`🎥 开始视频`, debugInfo);
+                            break;
+                        case 'EndVideo':
+                            this.addServerMessage(`🎥 视频结束`, debugInfo);
+                            break;
+                        case 'EndResponse':
+                            this.addServerMessage(`✅ 响应完成`, debugInfo);
+                            break;
+                        default:
+                            this.addServerMessage(`📦 未知字符串事件: ${data}`, debugInfo);
+                    }
+                } else if (typeof data === 'object' && data !== null) {
+                    // 处理带有数据的事件对象
+                    const eventType = Object.keys(data)[0];
+                    const eventData = data[eventType];
+
+                    switch (eventType) {
+                        case 'HelloChunk':
+                            this.addServerMessage(`👋 问候数据块 (${eventData[0] ? eventData[0].length : 0} 字节)`, debugInfo);
+                            break;
+                        case 'BGChunk':
+                            this.addServerMessage(`🎵 背景音乐数据块 (${eventData[0] ? eventData[0].length : 0} 字节)`, debugInfo);
+                            break;
+                        case 'ASR':
+                            // ASR 结果显示为用户消息（右边）
+                            const asrText = eventData[0] || '无内容';
+                            this.addUserMessage(`🎤 ${asrText}`, debugInfo);
+                            break;
+                        case 'Action':
+                            this.addServerMessage(`⚡ 动作: ${eventData[0] || '无动作'}`, debugInfo);
+                            break;
+                        case 'StartAudio':
+                            // 开始接收音频数据
+                            this.isReceivingAudio = true;
+                            this.audioChunks = [];
+                            this.addServerMessage(`🔊 : ${eventData[0] || '无文本'}`, debugInfo);
+                            break;
+                        case 'AudioChunk':
+                            // 缓存音频数据，不添加消息显示
+                            if (this.isReceivingAudio && eventData[0]) {
+                                this.audioChunks.push(eventData[0]);
+                                // 只在调试模式下显示音频块信息
+                                if (this.debugMode) {
+                                    this.addServerMessage(`🔊 音频数据块 (${eventData[0].length} 字节)`, debugInfo);
+                                }
+                            }
+                            break;
+                        default:
+                            this.addServerMessage(`📦 未知对象事件: ${eventType} - ${JSON.stringify(eventData)}`, debugInfo);
+                    }
+                } else {
+                    this.addServerMessage(`📦 MessagePack 数据: ${data}`, debugInfo);
+                }
+            }
+
+            processJSONData(data, debugInfo) {
+                if (typeof data === 'object' && data !== null) {
+                    if (data.type) {
+                        switch (data.type) {
+                            case 'transcription':
+                                // 语音识别结果显示为用户消息
+                                this.addUserMessage(`🎤 ${data.text || '无内容'}`, debugInfo);
+                                break;
+                            case 'response':
+                                this.addServerMessage(`💬 ${data.message || '无内容'}`, debugInfo);
+                                break;
+                            case 'error':
+                                this.addServerMessage(`❌ 错误: ${data.message || '未知错误'}`, debugInfo);
+                                break;
+                            case 'status':
+                                this.addServerMessage(`📊 状态: ${data.message || '无状态信息'}`, debugInfo);
+                                break;
+                            default:
+                                this.addServerMessage(`📄 JSON 数据: ${JSON.stringify(data)}`, debugInfo);
+                        }
+                    } else {
+                        this.addServerMessage(`📄 JSON 对象: ${JSON.stringify(data)}`, debugInfo);
+                    }
+                } else {
+                    this.addServerMessage(`📄 JSON 数据: ${data}`, debugInfo);
+                }
+            }
+
+            disconnectWebSocket() {
+                if (this.websocket) {
+                    this.websocket.close();
+                    this.websocket = null;
+                }
+            }
+
+            updateConnectionStatus(status, text) {
+                this.connectionStatus.classList.remove('hidden');
+                this.connectionStatusText.textContent = text;
+
+                this.connectionStatus.classList.remove('alert-info', 'alert-success', 'alert-warning', 'alert-error');
+
+                switch (status) {
+                    case 'connecting':
+                        this.connectionStatus.classList.add('alert-warning');
+                        break;
+                    case 'connected':
+                        this.connectionStatus.classList.add('alert-success');
+                        break;
+                    case 'disconnected':
+                        this.connectionStatus.classList.add('alert-error');
+                        break;
+                    default:
+                        this.connectionStatus.classList.add('alert-info');
+                }
+            }
+
+            async toggleRecording() {
+                if (!this.myvad) return;
+
+                if (this.isVadActive) {
+                    this.myvad.pause();
+                    this.isVadActive = false;
+                    this.addServerMessage('⏹️ VAD 已停止');
+
+                    // 关闭 VAD 监听时同时断开服务器连接
+                    if (this.isConnected) {
+                        this.disconnectWebSocket();
+                        this.addServerMessage('🔌 已断开服务器连接');
+                    }
+                } else {
+                    try {
+                        // 如果是录制模式，重新连接服务器并添加 record=true 参数
+                        if (this.recordingMode) {
+                            if (this.isConnected) {
+                                this.addServerMessage('🔄 录制模式：重新连接服务器...');
+                                this.disconnectWebSocket();
+                                // 等待断开完成
+                                await new Promise(resolve => setTimeout(resolve, 100));
+                            }
+                            this.connectWebSocket(true); // 添加 record=true 参数
+                            // 等待连接建立
+                            await new Promise(resolve => setTimeout(resolve, 1000));
+                        } else {
+                            // 对话模式下确保连接已建立
+                            this.connectWebSocket(false);
+                            // 等待连接建立
+                            await new Promise(resolve => setTimeout(resolve, 1000));
+                        }
+
+                        await this.myvad.start();
+                        this.isVadActive = true;
+                        const modeText = this.recordingMode ? '录制模式' : '对话模式';
+                        this.addServerMessage(`🎧 VAD 开始监听 (${modeText})`);
+                    } catch (error) {
+                        this.addServerMessage(`❌ VAD 启动失败: ${error.message}`);
+                        console.error('VAD 启动失败:', error);
+                    }
+                }
+
+                this.updateRecordingUI();
+            }
+
+            sendAudioToServer(audioData) {
+                if (this.websocket && this.isConnected) {
+                    // 将 Float32Array 转换为 Int16Array (16-bit PCM)
+                    const int16Array = new Int16Array(audioData.length);
+                    for (let i = 0; i < audioData.length; i++) {
+                        int16Array[i] = Math.max(-32768, Math.min(32767, audioData[i] * 32767));
+                    }
+
+                    if (this.recordingMode) {
+                        this.websocket.send(JSON.stringify({ event: 'StartRecord' }));
+                    } else {
+                        this.websocket.send(JSON.stringify({ event: 'StartChat' }));
+                    }
+
+                    this.websocket.send(int16Array.buffer);
+                    console.log('发送 VAD 音频数据到服务器，长度:', int16Array.length);
+
+                    // 根据录制模式发送不同的结束标识
+                    const endMarker = this.recordingMode ? "Recording" : "Normal";
+                    this.websocket.send(JSON.stringify({ event: 'Submit' }));
+                    console.log('发送结束标识:', endMarker);
+
+                    // 在调试模式下显示发送的结束标识
+                    if (this.debugMode) {
+                        this.addServerMessage(`📤 发送结束标识: ${endMarker}`);
+                    }
+                }
+            }
+
+            resampleTo16000(inputData, inputSampleRate) {
+                // 如果输入采样率已经是 16000，直接返回
+                if (inputSampleRate === 16000) {
+                    return inputData;
+                }
+
+                // 计算重采样比率
+                const ratio = inputSampleRate / 16000;
+                const outputLength = Math.floor(inputData.length / ratio);
+                const output = new Float32Array(outputLength);
+
+                // 简单的线性插值重采样
+                for (let i = 0; i < outputLength; i++) {
+                    const srcIndex = i * ratio;
+                    const srcIndexInt = Math.floor(srcIndex);
+                    const srcIndexNext = Math.min(srcIndexInt + 1, inputData.length - 1);
+                    const weight = srcIndex - srcIndexInt;
+
+                    output[i] = inputData[srcIndexInt] * (1 - weight) + inputData[srcIndexNext] * weight;
+                }
+
+                return output;
+            }
+
+            stopRecording() {
+                // 已被 VAD 替换，保留空函数以防引用
+            }
+
+            processCompletedAudio() {
+                try {
+                    // 计算总的音频数据长度
+                    let totalLength = 0;
+                    for (let chunk of this.audioChunks) {
+                        totalLength += chunk.length;
+                    }
+
+                    // 合并所有音频数据块
+                    const combinedData = new Uint8Array(totalLength);
+                    let offset = 0;
+                    for (let chunk of this.audioChunks) {
+                        combinedData.set(chunk, offset);
+                        offset += chunk.length;
+                    }
+
+                    // 将字节数据转换为 Int16Array（小端格式）
+                    const int16Data = new Int16Array(combinedData.buffer);
+
+                    // 直接使用 Int16 数据创建 WAV 文件
+                    const wavBlob = this.createWavFileFromInt16(int16Data, 16000);
+                    const audioUrl = URL.createObjectURL(wavBlob);
+
+                    // 添加到服务器消息中
+                    this.addAudioMessage(audioUrl, false, `处理了 ${this.audioChunks.length} 个音频块，总长度 ${totalLength} 字节`);
+
+                    // 自动播放音频
+                    this.queueAudio(audioUrl);
+
+                    console.log(`处理完成的音频: ${this.audioChunks.length} 个块, 总长度: ${totalLength} 字节, 时长: ${int16Data.length / 16000} 秒`);
+                } catch (error) {
+                    console.error('处理音频数据失败:', error);
+                    this.addServerMessage('处理音频数据失败: ' + error.message);
+                }
+            }
+
+            queueAudio(audioUrl) {
+                this.audioQueue.push(audioUrl);
+                this.playNextAudio();
+            }
+
+            playNextAudio() {
+                if (this.isPlaying || this.audioQueue.length === 0) {
+                    return;
+                }
+
+                const audioUrl = this.audioQueue.shift();
+                this.currentAudio = new Audio(audioUrl);
+                this.isPlaying = true;
+
+                this.currentAudio.onended = () => {
+                    this.isPlaying = false;
+                    this.currentAudio = null;
+                    // 播放下一个音频
+                    this.playNextAudio();
+                };
+
+                this.currentAudio.onerror = (error) => {
+                    console.error('音频播放失败:', error);
+                    this.isPlaying = false;
+                    this.currentAudio = null;
+                    // 尝试播放下一个音频
+                    this.playNextAudio();
+                };
+
+                this.currentAudio.play().catch(error => {
+                    console.error('音频播放失败:', error);
+                    this.isPlaying = false;
+                    this.currentAudio = null;
+                    // 尝试播放下一个音频
+                    this.playNextAudio();
+                });
+            }
+
+            createWavFileFromInt16(int16Data, sampleRate) {
+                const length = int16Data.length;
+                const buffer = new ArrayBuffer(44 + length * 2);
+                const view = new DataView(buffer);
+
+                // WAV 头部
+                const writeString = (offset, string) => {
+                    for (let i = 0; i < string.length; i++) {
+                        view.setUint8(offset + i, string.charCodeAt(i));
+                    }
+                };
+
+                writeString(0, 'RIFF');
+                view.setUint32(4, 36 + length * 2, true);
+                writeString(8, 'WAVE');
+                writeString(12, 'fmt ');
+                view.setUint32(16, 16, true);
+                view.setUint16(20, 1, true);
+                view.setUint16(22, 1, true);
+                view.setUint32(24, sampleRate, true);
+                view.setUint32(28, sampleRate * 2, true);
+                view.setUint16(32, 2, true);
+                view.setUint16(34, 16, true);
+                writeString(36, 'data');
+                view.setUint32(40, length * 2, true);
+
+                // 直接写入 Int16 PCM 数据
+                let offset = 44;
+                for (let i = 0; i < length; i++) {
+                    view.setInt16(offset, int16Data[i], true); // 小端格式
+                    offset += 2;
+                }
+
+                return new Blob([buffer], { type: 'audio/wav' });
+            }
+
+            createWavFile(pcmData, sampleRate) {
+                const length = pcmData.length;
+                const buffer = new ArrayBuffer(44 + length * 2);
+                const view = new DataView(buffer);
+
+                // WAV 头部
+                const writeString = (offset, string) => {
+                    for (let i = 0; i < string.length; i++) {
+                        view.setUint8(offset + i, string.charCodeAt(i));
+                    }
+                };
+
+                writeString(0, 'RIFF');
+                view.setUint32(4, 36 + length * 2, true);
+                writeString(8, 'WAVE');
+                writeString(12, 'fmt ');
+                view.setUint32(16, 16, true);
+                view.setUint16(20, 1, true);
+                view.setUint16(22, 1, true);
+                view.setUint32(24, sampleRate, true);
+                view.setUint32(28, sampleRate * 2, true);
+                view.setUint16(32, 2, true);
+                view.setUint16(34, 16, true);
+                writeString(36, 'data');
+                view.setUint32(40, length * 2, true);
+
+                // 写入 PCM 数据
+                let offset = 44;
+                for (let i = 0; i < length; i++) {
+                    const sample = Math.max(-32768, Math.min(32767, pcmData[i] * 32767));
+                    view.setInt16(offset, sample, true);
+                    offset += 2;
+                }
+
+                return new Blob([buffer], { type: 'audio/wav' });
+            }
+
+            updateRecordingUI() {
+                if (this.isVadActive) {
+                    this.recordBtn.classList.add('btn-error');
+                    this.recordBtn.classList.remove('btn-primary');
+                    this.recordText.textContent = '停止监听';
+
+                    // 更新麦克风图标为停止图标
+                    this.micIcon.innerHTML = `
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 6h12v12H6z"></path>
+                    `;
+                } else {
+                    this.recordBtn.classList.remove('btn-error');
+                    this.recordBtn.classList.add('btn-primary');
+                    this.recordText.textContent = '开始监听';
+
+                    // 恢复麦克风图标
+                    this.micIcon.innerHTML = `
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"></path>
+                    `;
+                }
+            }
+
+            addAudioMessage(audioUrl, isUser = true, debugInfo = '') {
+                const chatPosition = isUser ? 'chat-end' : 'chat-start';
+                const messageLabel = isUser ? '语音消息' : '语音回复';
+
+                const debugHtml = this.debugMode && debugInfo ?
+                    `<div class="message-debug">${debugInfo}</div>` : '';
+
+                const messageHtml = `
+                    <div class="chat ${chatPosition}">
+                        <div class="chat-bubble">
+                            <div class="flex items-center gap-2">
+                                <button class="btn btn-xs btn-ghost" onclick="this.nextElementSibling.play()">
+                                    <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
+                                        <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clip-rule="evenodd"></path>
+                                    </svg>
+                                    <span>${messageLabel}</span>
+                                </button>
+                                <audio preload="metadata">
+                                    <source src="${audioUrl}" type="audio/wav">
+                                    您的浏览器不支持音频播放
+                                </audio>
+                            </div>
+                            ${debugHtml}
+                        </div>
+                    </div>
+                `;
+
+                this.chatMessages.insertAdjacentHTML('beforeend', messageHtml);
+                this.scrollToBottom();
+            }
+
+            addUserMessage(message, debugInfo = '') {
+                const debugHtml = this.debugMode && debugInfo ?
+                    `<div class="message-debug">${debugInfo}</div>` : '';
+
+                const messageHtml = `
+                    <div class="chat chat-end">
+                        <div class="chat-bubble">
+                            ${message}
+                            ${debugHtml}
+                        </div>
+                    </div>
+                `;
+
+                this.chatMessages.insertAdjacentHTML('beforeend', messageHtml);
+                this.scrollToBottom();
+            }
+
+            addServerMessage(message, debugInfo = '') {
+                const debugHtml = this.debugMode && debugInfo ?
+                    `<div class="message-debug">${debugInfo}</div>` : '';
+
+                const messageHtml = `
+                    <div class="chat chat-start">
+                        <div class="chat-bubble">
+                            ${message}
+                            ${debugHtml}
+                        </div>
+                    </div>
+                `;
+
+                this.chatMessages.insertAdjacentHTML('beforeend', messageHtml);
+                this.scrollToBottom();
+            }
+
+            clearChat() {
+                this.chatMessages.innerHTML = '';
+            }
+
+            scrollToBottom() {
+                this.chatContainer.scrollTop = this.chatContainer.scrollHeight;
+            }
+        }
+
+        // 初始化应用
+        document.addEventListener('DOMContentLoaded', () => {
+            new AudioRecorder();
+        });
+    </script>
+</body>
+
+</html>
